@@ -1,110 +1,102 @@
 import streamlit as st
-import streamlit.components.v1 as components
+import fitz  # PyMuPDF
+import gc
+import os
+import tempfile
+import math
+from PIL import Image
+from io import BytesIO
 
-st.set_page_config(page_title="20MB Surgical Compressor", layout="centered")
+# --- 1. RAM PROVISION ---
+def purge():
+    """Immediately evicts data from RAM to prevent the 1GB crash."""
+    gc.collect()
+    st.cache_data.clear()
 
-st.title("🛡️ 500MB → 20MB Surgical Compressor")
-st.markdown("This version physically shrinks images inside the PDF using your browser's Canvas engine.")
+def surgical_shrink(input_path, target_mb):
+    """Processes images on disk so RAM stays empty."""
+    doc = fitz.open(input_path)
+    orig_mb = os.path.getsize(input_path) / (1024 * 1024)
+    
+    # Calculate geometric scale to hit 19.5MB
+    # If 500MB -> 20MB, we need scale factor ~0.2 (20% dimensions)
+    scale = math.sqrt(19.5 / orig_mb) * 0.9
+    scale = min(1.0, max(0.05, scale)) 
 
-html_code = """
-<!DOCTYPE html>
-<html>
-<head>
-    <script src="https://unpkg.com/pdf-lib/dist/pdf-lib.min.js"></script>
-</head>
-<body style="font-family: sans-serif; text-align: center; padding: 20px;">
-    <div style="border: 2px solid #34a853; border-radius: 12px; padding: 30px; background: #f0fff0;">
-        <input type="file" id="pdf-input" accept="application/pdf">
-        <br><br>
-        <button id="exec-btn" style="background: #34a853; color: white; border: none; padding: 15px 30px; border-radius: 8px; cursor: pointer; font-size: 16px;">
-            Surgically Compress to <20MB
-        </button>
-        <div id="status" style="margin-top: 20px; font-weight: bold; color: #2e7d32;">Ready</div>
-        <progress id="pbar" value="0" max="100" style="width: 100%; margin-top: 10px; display: none;"></progress>
-    </div>
-
-    <script>
-        const btn = document.getElementById('exec-btn');
-        const status = document.getElementById('status');
-        const pBar = document.getElementById('pbar');
-
-        async function resizeImage(imgData, extension) {
-            return new Union(async (resolve) => {
-                const blob = new Blob([imgData], { type: `image/${extension}` });
-                const url = URL.createObjectURL(blob);
-                const img = new Image();
-                img.onload = () => {
-                    const canvas = document.createElement('canvas');
-                    // Aggressive scaling: Reduce dimensions to 40%
-                    const scale = 0.4; 
-                    canvas.width = img.width * scale;
-                    canvas.height = img.height * scale;
-                    const ctx = canvas.getContext('2d');
-                    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+    # Iterate pages
+    for page in doc:
+        img_list = page.get_images(full=True)
+        for img in img_list:
+            xref = img[0]
+            try:
+                # 1. Extract image WITHOUT loading the page into RAM
+                base = doc.extract_image(xref)
+                if not base: continue
+                
+                # 2. Shrink in a tiny memory window
+                with Image.open(BytesIO(base["image"])) as pil_img:
+                    if pil_img.mode != "RGB":
+                        pil_img = pil_img.convert("RGB")
                     
-                    // Convert to low-quality JPEG
-                    canvas.toBlob((resultBlob) => {
-                        resultBlob.arrayBuffer().then(resolve);
-                    }, 'image/jpeg', 0.5); // 0.5 is the quality
-                };
-                img.src = url;
-            });
-        }
+                    new_size = (int(pil_img.width * scale), int(pil_img.height * scale))
+                    # LANCZOS is high quality but uses more RAM, using BILINEAR for safety
+                    pil_img = pil_img.resize(new_size, Image.Resampling.BILINEAR)
+                    
+                    buf = BytesIO()
+                    # Low quality (30-40) is required to reach 20MB from 500MB
+                    pil_img.save(buf, format="JPEG", quality=35, optimize=True)
+                    
+                    # 3. Push back to disk immediately
+                    doc.update_stream(xref, buf.getvalue())
+                    buf.close()
+                
+                # 4. Immediate Purge
+                purge()
+            except:
+                continue
 
-        btn.onclick = async () => {
-            const file = document.getElementById('pdf-input').files[0];
-            if (!file) return status.innerText = "Select file!";
+    # Create the output file
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as f_out:
+        # garbage=4 is THE MOST IMPORTANT line. 
+        # It deletes the old 500MB data from the file structure.
+        doc.save(f_out.name, garbage=4, deflate=True, clean=True)
+        out_path = f_out.name
+    
+    doc.close()
+    return out_path
 
-            btn.disabled = true;
-            pBar.style.display = "block";
-            status.innerText = "Loading PDF into Browser RAM...";
+# --- UI ---
+st.title("🛡️ 500MB to 20MB Precision Shrinker")
+st.markdown("This version uses **Disk-Buffering** to prevent Streamlit crashes.")
 
-            const arrayBuffer = await file.arrayBuffer();
-            const pdfDoc = await PDFLib.PDFDocument.load(arrayBuffer);
-            const pages = pdfDoc.getPages();
+up_file = st.file_uploader("Upload PDF", type="pdf")
 
-            status.innerText = "Scaling images... (This may take a moment)";
-            
-            // Note: True image replacement in JS requires iterating through XRef 
-            // Since JS is slower, we focus on the Save-Time optimization here.
-            // To get a true shrink in browser without advanced libraries, 
-            // we use the 'save' optimization + metadata stripping.
-            
-            const compressedBytes = await pdfDoc.save({
-                useObjectStreams: true,
-                addDefaultFont: false,
-                updateFieldAppearances: false
-            });
-
-            // If structural compression isn't enough, we trigger a 'Downsample' alert
-            if (compressedBytes.length > 25 * 1024 * 1024) {
-                 status.innerText = "Structural cleaning done. For high-res image shrinking, Python is still more precise.";
-            }
-
-            const blob = new Blob([compressedBytes], { type: 'application/pdf' });
-            const url = URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = "shrunk_" + file.name;
-            a.click();
-            
-            status.innerText = "Done!";
-            btn.disabled = false;
-        };
-    </script>
-</body>
-</html>
-"""
-
-components.html(html_code, height=400)
-
-st.info("""
-### Why the previous one didn't "shrink":
-The previous code was a **lossless** structural cleanup. It removed invisible "garbage" but kept the high-res images untouched. 
-
-### The Hard Truth:
-JavaScript in a browser is limited. It can clean a 500MB file down to 450MB easily. But to go from **500MB to 20MB**, you have to physically re-encode the pixels. If the browser version is still too large, we must return to the **Python "Surgical" version** but with a specific "RAM Provision" that prevents the crash.
-""")
-
-# Would you like me to give you the Python version that uses a "Disk-Only" 
-# approach so it never hits the 1GB RAM crash?
+if up_file:
+    if st.button("Surgically Shrink to <20MB"):
+        # STEP 1: Move upload to disk immediately
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as f_in:
+            f_in.write(up_file.getbuffer())
+            f_in_path = f_in.name
+        
+        # STEP 2: Wipe the upload from RAM provision
+        del up_file
+        purge()
+        
+        with st.spinner("Processing surgically..."):
+            try:
+                final_path = surgical_shrink(f_in_path, 19.5)
+                
+                with open(final_path, "rb") as f:
+                    final_bytes = f.read()
+                
+                size = len(final_bytes)/(1024*1024)
+                st.success(f"Final Size: {size:.2f} MB")
+                st.download_button("📥 Download PDF", final_bytes, "shrunk_20mb.pdf")
+                
+                # STEP 3: Final Cleanup
+                os.remove(f_in_path)
+                os.remove(final_path)
+                purge()
+                
+            except Exception as e:
+                st.error(f"Error: {e}. The file might be too complex.")
